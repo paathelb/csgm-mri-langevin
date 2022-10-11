@@ -98,11 +98,58 @@ class LangevinOptimizer(torch.nn.Module):
         x = torch_fft.ifftshift(x, dim=(-2, -1))
         return x
 
+    # Added by Helbert Paat
+    def leapfrog_traj(self, samples, momentum, L, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps):
+        #q = q0.copy()
+        #p = p0.copy()
+        traj = [samples.detach().clone()]
+
+        for i in range(L):
+            #p += target.grad_log_density(q) * step_size / 2
+            #q += p * step_size
+            #p += target.grad_log_density(q) * step_size / 2
+            #traj.append(q.copy())
+
+            noise = torch.randn_like(samples) * np.sqrt(step_size * 2) # 1 x C x X x Y
+
+            # get score from model
+            p_grad = self.score(samples, labels) # 1 x C x X x Y # Samples are randomly initialized 
+
+            # get measurements for current estimate
+            meas = forward_operator(normalize(samples, estimated_mvue)) # 1 x numslices x X x Y # shape before forward_op 1 x C x X x Y # TODO Why do we normalize it?
+            # compute gradient, i.e., gradient = A_adjoint * ( y - Ax_hat )
+            # here A_adjoint also involves the sensitivity maps, hence the pointwise multiplication
+            # also convert to real value since the ``complex'' image is a real-valued two channel image
+            meas_grad = torch.view_as_real(torch.sum(self._ifft(meas-ref) * torch.conj(maps), axis=1) ).permute(0,3,1,2) # 1 x C x X x Y
+            # re-normalize, since measuremenets are from a normalized estimate
+            meas_grad = unnormalize(meas_grad, estimated_mvue)  # 1 x C x X x Y
+            # convert to float incase it somehow became double
+            meas_grad = meas_grad.type(torch.cuda.FloatTensor)  # 1 x C x X x Y
+            meas_grad /= torch.norm( meas_grad )                # 1 x C x X x Y
+            meas_grad *= torch.norm( p_grad )                   # 1 x C x X x Y
+            meas_grad *= self.config['mse']                     # 1 x C x X x Y
+
+            # combine measurement gradient, prior gradient and noise
+            #samples = samples + step_size * (p_grad - meas_grad) + noise    # 1 x C x X x Y # Why (p_grad - meas_grad)? not (p_grad + meas_grad)?
+            momentum += (step_size/2) * (p_grad - meas_grad) + noise    # 1 x C x X x Y
+            samples += momentum * step_size 
+            momentum += (step_size/2) * (p_grad - meas_grad) + noise    # 1 x C x X x Y
+            traj.append(samples.detach().clone())
+
+        # compute metrics every after one pass of leapfrog integrator
+        metrics = [c, step_size, (meas-ref).norm(), (p_grad-meas_grad).abs().mean(), (p_grad-meas_grad).abs().max()]
+        update_pbar_desc(pbar, metrics, pbar_labels)
+        # if nan, break
+        if np.isnan((meas - ref).norm().cpu().numpy()):
+            return normalize(samples, estimated_mvue)
+
+        return samples, momentum, traj
+
     def _sample(self, y):
-        ref, mvue, maps, batch_mri_mask = y
+        ref, mvue, maps, batch_mri_mask = y         # 1 x numslice x X x Y   # 1 x 1 x X x Y     # 1 x numslice x X x Y      # 1 x X
         estimated_mvue = torch.tensor(
             get_mvue(ref.cpu().numpy(),
-            maps.cpu().numpy()), device=ref.device)
+            maps.cpu().numpy()), device=ref.device) # 1 x X x Y     # TODO Why is the estimated MVUE fixed?
         self.logger.info(f"Running {self.langevin_config.model.num_classes} steps of Langevin.")
 
         pbar = tqdm(range(self.langevin_config.model.num_classes), disable=(self.config['device'] != 0))
@@ -110,52 +157,47 @@ class LangevinOptimizer(torch.nn.Module):
         step_lr = self.langevin_config.sampling.step_lr
         forward_operator = lambda x: MulticoilForwardMRI(self.config['orientation'])(torch.complex(x[:, 0], x[:, 1]), maps, batch_mri_mask)
 
-
         samples = torch.rand(y[0].shape[0], self.langevin_config.data.channels,
                                  self.config['image_size'][0],
-                                 self.config['image_size'][1], device=self.device)
+                                 self.config['image_size'][1], device=self.device) # 1 x C x X x Y   # 1 x 2 x 384 x 384
+                                 
+        # TODO
+        # Understand HMC
+        # Where should we place the momentum?
+        # How to define the log of the densities?
 
         with torch.no_grad():
             for c in pbar:
                 if c <= self.config['start_iter']:
                     continue
+                import pdb; pdb.set_trace() 
                 if c <= 1800:
                     n_steps_each = 3
                 else:
                     n_steps_each = self.langevin_config.sampling.n_steps_each
-                sigma = self.sigmas[c]
-                labels = torch.ones(samples.shape[0], device=samples.device) * c
+                sigma = self.sigmas[c] # num_classes 
+                labels = torch.ones(samples.shape[0], device=samples.device) * c # B=1
                 labels = labels.long()
                 step_size = step_lr * (sigma / self.sigmas[-1]) ** 2
 
                 for s in range(n_steps_each):
-                    noise = torch.randn_like(samples) * np.sqrt(step_size * 2)
-                    # get score from model
-                    p_grad = self.score(samples, labels)
 
-                    # get measurements for current estimate
-                    meas = forward_operator(normalize(samples, estimated_mvue))
-                    # compute gradient, i.e., gradient = A_adjoint * ( y - Ax_hat )
-                    # here A_adjoint also involves the sensitivity maps, hence the pointwise multiplication
-                    # also convert to real value since the ``complex'' image is a real-valued two channel image
-                    meas_grad = torch.view_as_real(torch.sum(self._ifft(meas-ref) * torch.conj(maps), axis=1) ).permute(0,3,1,2)
-                    # re-normalize, since measuremenets are from a normalized estimate
-                    meas_grad = unnormalize(meas_grad, estimated_mvue)
-                    # convert to float incase it somehow became double
-                    meas_grad = meas_grad.type(torch.cuda.FloatTensor)
-                    meas_grad /= torch.norm( meas_grad )
-                    meas_grad *= torch.norm( p_grad )
-                    meas_grad *= self.config['mse']
+                    # Added by Helbert Paat
+                    momentum = torch.randn_like(samples)  # 1 x C x X x Y           # Same as sample but normally distributed
+                    samples_star, momentum_star, traj = self.leapfrog_traj(self, samples, momentum, 50, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps)
 
-                    # combine measurement gradient, prior gradient and noise
-                    samples = samples + step_size * (p_grad - meas_grad) + noise
+                    log_accept_ratio = 0
+                    for index,tr in enumerate(traj[1:]):
+                        log_accept_ratio += self.score(tr, labels)*(tr-traj[index]) # What is the dimension of this? # This is via numerical approximation
+                    #h0 = -target.log_density(q0) + (p0 * p0).sum() / 2
+                    #h = -target.log_density(q_star) + (p_star * p_star).sum() / 2
+                    log_accept_ratio += momentum_star.sum() - momentum.sum() 
 
-                    # compute metrics
-                    metrics = [c, step_size, (meas-ref).norm(), (p_grad-meas_grad).abs().mean(), (p_grad-meas_grad).abs().max()]
-                    update_pbar_desc(pbar, metrics, pbar_labels)
-                    # if nan, break
-                    if np.isnan((meas - ref).norm().cpu().numpy()):
-                        return normalize(samples, estimated_mvue)
+                    if np.random.random() < np.exp(log_accept_ratio):
+                        samples = samples_star
+                    else:
+                        pass
+                        
                 if self.config['save_images']:
                     if (c+1) % self.config['save_iter'] ==0 :
                         img_gen = normalize(samples, estimated_mvue)
@@ -195,14 +237,14 @@ class LangevinOptimizer(torch.nn.Module):
                 # if c>=0:
                 #     break
 
-        return normalize(samples, estimated_mvue)
+        return normalize(samples, estimated_mvue) # 1 x C x X x Y
 
 
 
     def sample(self, y):
         self._initialize()
         mvue = self._sample(y)
-
+        
         outputs = []
         for i in range(y[0].shape[0]):
             outputs_ = {
@@ -235,7 +277,7 @@ def mp_run(rank, config, project_dir, working_dir, files):
         experiment = OfflineExperiment(
                                 project_name=project_name,
                                 auto_output_logging='simple',
-                                offline_directory="./outputs")
+                                offline_directory="./outputs") # TODO What is the purpose? Related to comet. --> results in error
 
         experiment.log_parameters(config)
         pretty(config)
@@ -285,7 +327,7 @@ def mp_run(rank, config, project_dir, working_dir, files):
     else:
         raise NotImplementedError('anatomy not implemented, please write dataloader to process kspace appropriately')
 
-    sampler = DistributedSampler(dataset, rank=rank, shuffle=True) if config['multiprocessing'] else None
+    sampler = DistributedSampler(dataset, rank=rank, shuffle=True) if config['multiprocessing'] else None # TODO Purpose of sampler? Sampler only works when multiprocessing is True
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
 
@@ -308,7 +350,7 @@ def mp_run(rank, config, project_dir, working_dir, files):
                     mask: binary valued kspace mask
         '''
 
-        ref, mvue, maps, mask = sample['ground_truth'], sample['mvue'], sample['maps'], sample['mask']
+        ref, mvue, maps, mask = sample['ground_truth'], sample['mvue'], sample['maps'], sample['mask'] # 1 x numslices x 384 x 384  # 1 x 1 x 384 x 384  # 1 x numslices x 384 x 384  # 1 x 384
         # uncomment for meniscus tears
         # exp_name = sample['mvue_file'][0].split('/')[-1] + '|langevin|' + f'slide_idx_{sample["slice_idx"][0].item()}'
         # # if exp_name != 'file1000425.h5|langevin|slide_idx_22':
@@ -316,13 +358,13 @@ def mp_run(rank, config, project_dir, working_dir, files):
         #     continue
 
         # move everything to cuda
-        ref = ref.to(rank).type(torch.complex128)
-        mvue = mvue.to(rank)
-        maps = maps.to(rank)
-        mask = mask.to(rank)
+        ref = ref.to(rank).type(torch.complex128) # 1 x numslices x 384 x 384
+        mvue = mvue.to(rank) # 1 x 1 x 384 x 384
+        maps = maps.to(rank) # 1 x numslices x 384 x 384
+        mask = mask.to(rank) # 1 x 384
         estimated_mvue = torch.tensor(
             get_mvue(ref.cpu().numpy(),
-            maps.cpu().numpy()), device=ref.device)
+            maps.cpu().numpy()), device=ref.device) # 1 x 384 x 384
 
 
         exp_names = []
@@ -341,7 +383,7 @@ def mp_run(rank, config, project_dir, working_dir, files):
                 save_images(mvue[batch_idx:batch_idx+1].abs().flip(-2), file_name, normalize=True)
                 if experiment is not None:
                     experiment.log_image(file_name)
-
+        import pdb; pdb.set_trace() 
         langevin_optimizer.config['exp_names'] = exp_names
         if config['repeat'] > 1:
             repeat = config['repeat']
@@ -366,15 +408,15 @@ def mp_run(rank, config, project_dir, working_dir, files):
 @hydra.main(config_path='configs')
 def main(config):
     """ setup """
-
-    working_dir = os.getcwd()
-    project_dir = hydra.utils.get_original_cwd()
+    
+    working_dir = os.getcwd() # Output folder
+    project_dir = hydra.utils.get_original_cwd() # Github repo folder
 
     folder_path = os.path.join(project_dir, config['input_dir'])
     if config['anatomy'] == 'stanford_knees':
         files = get_all_files(folder_path, pattern=f'*R{config["R"]}*.h5')
     else:
-        files = get_all_files(folder_path, pattern='*.h5')
+        files = get_all_files(folder_path, pattern='*.h5') # List containing string of dataset path
 
     if not config['multiprocessing']:
         mp_run(0, config, project_dir, working_dir, files)
