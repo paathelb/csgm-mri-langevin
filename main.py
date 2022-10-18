@@ -100,20 +100,19 @@ class LangevinOptimizer(torch.nn.Module):
 
     # Added by Helbert Paat
     def leapfrog_traj(self, samples, momentum, L, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps):
-        #q = q0.copy()
-        #p = p0.copy()
         traj = [samples.detach().clone()]       # 1 x C x X x Y     # [1 x 2 x 384 x 384]
+        scores = []
 
         for i in range(L):
             #p += target.grad_log_density(q) * step_size / 2
             #q += p * step_size
             #p += target.grad_log_density(q) * step_size / 2
-            #traj.append(q.copy())
 
-            noise = torch.randn_like(samples) * np.sqrt(step_size * 2) # 1 x C x X x Y  # 1 x 2 x 384 x 384
+            #noise = torch.randn_like(samples) * np.sqrt(step_size * 2) # 1 x C x X x Y  # 1 x 2 x 384 x 384
 
             # get score from model
-            p_grad = self.score(samples, labels) # 1 x C x X x Y    # 1 x 2 x 384 x 384     # Samples are randomly initialized 
+            p_grad = self.score(samples, labels)        # 1 x C x X x Y    # 1 x 2 x 384 x 384     # Samples are randomly initialized 
+            scores.append(p_grad.detach().clone())
 
             # get measurements for current estimate
             meas = forward_operator(normalize(samples, estimated_mvue)) # 1 x numslices x X x Y # shape before forward_op 1 x C x X x Y # TODO Why do we normalize it?
@@ -131,9 +130,9 @@ class LangevinOptimizer(torch.nn.Module):
 
             # combine measurement gradient, prior gradient and noise
             #samples = samples + step_size * (p_grad - meas_grad) + noise    # 1 x C x X x Y # Why (p_grad - meas_grad)? not (p_grad + meas_grad)?
-            momentum += (step_size/2) * (p_grad - meas_grad) + noise    # 1 x C x X x Y
+            momentum += (step_size/2) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
             samples += momentum * step_size 
-            momentum += (step_size/2) * (p_grad - meas_grad) + noise    # 1 x C x X x Y
+            momentum += (step_size/2) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
             traj.append(samples.detach().clone())
 
         # compute metrics every after one pass of leapfrog integrator
@@ -143,10 +142,10 @@ class LangevinOptimizer(torch.nn.Module):
         if np.isnan((meas - ref).norm().cpu().numpy()):
             return normalize(samples, estimated_mvue)
 
-        return samples, -momentum, traj     # perform momentum flip?
+        return samples, -momentum, traj, scores     # perform momentum flip?
 
     def _sample(self, y):
-        ref, mvue, maps, batch_mri_mask = y         # 1 x numslice x X x Y   # 1 x 1 x X x Y     # 1 x numslice x X x Y      # 1 x X
+        ref, mvue, maps, batch_mri_mask = y                 # 1 x numslice x X x Y   # 1 x 1 x X x Y     # 1 x numslice x X x Y      # 1 x X
         estimated_mvue = torch.tensor(
             get_mvue(ref.cpu().numpy(),
             maps.cpu().numpy()), device=ref.device) # 1 x X x Y     # TODO Why is the estimated MVUE fixed?
@@ -160,17 +159,11 @@ class LangevinOptimizer(torch.nn.Module):
         samples = torch.rand(y[0].shape[0], self.langevin_config.data.channels,
                                  self.config['image_size'][0],
                                  self.config['image_size'][1], device=self.device) # 1 x C x X x Y   # 1 x 2 x 384 x 384
-                                 
-        # TODO
-        # Understand HMC
-        # Where should we place the momentum?
-        # How to define the log of the densities?
 
         with torch.no_grad():
             for c in pbar:
                 if c <= self.config['start_iter']:
                     continue
-                #import pdb; pdb.set_trace() 
                 if c <= 1800:
                     n_steps_each = 1 #3
                 else:
@@ -178,24 +171,27 @@ class LangevinOptimizer(torch.nn.Module):
                 sigma = self.sigmas[c] # num_classes 
                 labels = torch.ones(samples.shape[0], device=samples.device) * c # B=1
                 labels = labels.long()
-                step_size = step_lr * (sigma / self.sigmas[-1]) ** 2
+                step_size = step_lr * (sigma / self.sigmas[-1]) ** 2        # Varying step size?
 
                 for s in range(n_steps_each):
 
-                    # Added by Helbert Paat
-                    momentum = torch.randn_like(samples)  # 1 x C x X x Y           # Same as sample but normally distributed
-                    samples_star, momentum_star, traj = self.leapfrog_traj(samples, momentum, 50, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps)
+                    # Modified by Helbert Paat
+                    momentum = torch.randn_like(samples)        # 1 x C x X x Y           # Same as sample but normally distributed
+                    # TODO Make it learned --> momentum is multi gaussian with cov mat # learn covariance mat to reduce the no of iterations to achieve better quality # Think of loss functions, data to use
+                    samples_star, momentum_star, traj, scores = self.leapfrog_traj(samples, momentum, 5, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps)
                     # 1 x C x X x Y   # 1 x C x X x Y  # len of traj is (L+1) including initial sample
+                    # TODO Reduce L --> faster  # ideal is 10-15 mins for entire HMC
+                    # Larger step size --> faster (as long as quality does not suffer)
 
                     log_accept_ratio = 0
-                    # for index,tr in enumerate(traj[1:]):
-                    #     log_accept_ratio += -self.score(tr, labels) * (tr-traj[index])      # 1 x C x X x Y     # What is the dimension of this? # This is via numerical approximation
+                    for index,tr in enumerate(traj[1:]):
+                        log_accept_ratio += torch.matmul(-scores[index], (tr-traj[index]))     # Why perform dot product?    # 1 x C x X x Y     # What is the dimension of this? # TODO Double check the numerical approximation
                     #h0 = -target.log_density(q0) + (p0 * p0).sum() / 2
                     #h = -target.log_density(q_star) + (p_star * p_star).sum() / 2
-                    log_accept_ratio += -self.score(samples_star, labels) - (-self.score(samples, labels)) + (momentum_star*momentum_star).sum()/2 - (momentum*momentum).sum()/2
+                    log_accept_ratio += (momentum_star*momentum_star).sum()/2 - (momentum*momentum).sum()/2
                     #log_accept_ratio += momentum_star.sum() - momentum.sum() 
 
-                    if np.random.random() < np.exp(log_accept_ratio.mean().item()):
+                    if np.random.random() < np.exp(log_accept_ratio.mean().item()): # Should we really use the mean here?
                         samples = samples_star
                     else:
                         pass
