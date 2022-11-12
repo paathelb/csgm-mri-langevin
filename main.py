@@ -98,19 +98,31 @@ class LangevinOptimizer(torch.nn.Module):
         x = torch_fft.ifftshift(x, dim=(-2, -1))
         return x
 
-    # Added by Helbert Paat
+    # Changed/Modified/Added by Helbert Paat
     def leapfrog_traj(self, samples, momentum, L, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps):
         traj = [samples.detach().clone()]       # 1 x C x X x Y     # [1 x 2 x 384 x 384]
         scores = []
 
+        # Make A HALF STEP FOR THE MOMENTUM AT THE BEGINNING
+        # get score from model
+        p_grad = self.score(samples, labels)        # 1 x C x X x Y    # 1 x 2 x 384 x 384     # Samples are randomly initialized 
+
+        # get measurements for current estimate
+        meas = forward_operator(normalize(samples, estimated_mvue)) # 1 x numslices x X x Y # shape before forward_op 1 x C x X x Y # TODO Why do we normalize it?
+        meas_grad = torch.view_as_real(torch.sum(self._ifft(meas-ref) * torch.conj(maps), axis=1) ).permute(0,3,1,2) # 1 x C x X x Y
+        # re-normalize, since measuremenets are from a normalized estimate
+        meas_grad = unnormalize(meas_grad, estimated_mvue)  # 1 x C x X x Y
+        # convert to float incase it somehow became double
+        meas_grad = meas_grad.type(torch.cuda.FloatTensor)  # 1 x C x X x Y
+        meas_grad /= torch.norm( meas_grad )                # 1 x C x X x Y
+        meas_grad *= torch.norm( p_grad )                   # 1 x C x X x Y
+        meas_grad *= self.config['mse']                     # 1 x C x X x Y
+        momentum += (step_size/2) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
+
         for i in range(L):
-            #p += target.grad_log_density(q) * step_size / 2
-            #q += p * step_size
-            #p += target.grad_log_density(q) * step_size / 2
+            #noise = torch.randn_like(samples) * np.sqrt(step_size * 2) # 1 x C x X x Y  # 1 x 2 x 384 x 384        # No noise for vanilla HMC
 
-            #noise = torch.randn_like(samples) * np.sqrt(step_size * 2) # 1 x C x X x Y  # 1 x 2 x 384 x 384
-
-            # get score from model
+            # Get score from model
             p_grad = self.score(samples, labels)        # 1 x C x X x Y    # 1 x 2 x 384 x 384     # Samples are randomly initialized 
             scores.append(p_grad.detach().clone())
 
@@ -130,11 +142,28 @@ class LangevinOptimizer(torch.nn.Module):
 
             # combine measurement gradient, prior gradient and noise
             #samples = samples + step_size * (p_grad - meas_grad) + noise    # 1 x C x X x Y # Why (p_grad - meas_grad)? not (p_grad + meas_grad)?
-            momentum += (step_size/2) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
             samples += momentum * step_size 
-            momentum += (step_size/2) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
+            if i!=L-1: momentum += (step_size) * (p_grad - meas_grad) #+ noise    # 1 x C x X x Y
             traj.append(samples.detach().clone())
 
+        # MAKE A HALF STEP FOR MOMENTUM AT THE END
+        # Get score from model
+        p_grad = self.score(samples, labels)        # 1 x C x X x Y    # 1 x 2 x 384 x 384     # Samples are randomly initialized 
+
+        # get measurements for current estimate
+        meas = forward_operator(normalize(samples, estimated_mvue)) # 1 x numslices x X x Y # shape before forward_op 1 x C x X x Y # TODO Why do we normalize it?
+        # compute gradient, i.e., gradient = A_adjoint * ( y - Ax_hat )
+        meas_grad = torch.view_as_real(torch.sum(self._ifft(meas-ref) * torch.conj(maps), axis=1) ).permute(0,3,1,2) # 1 x C x X x Y
+        # re-normalize, since measuremenets are from a normalized estimate
+        meas_grad = unnormalize(meas_grad, estimated_mvue)  # 1 x C x X x Y
+        # convert to float incase it somehow became double
+        meas_grad = meas_grad.type(torch.cuda.FloatTensor)  # 1 x C x X x Y
+        meas_grad /= torch.norm( meas_grad )                # 1 x C x X x Y
+        meas_grad *= torch.norm( p_grad )                   # 1 x C x X x Y
+        meas_grad *= self.config['mse']                     # 1 x C x X x Y
+
+        momentum += (step_size/2) * (p_grad - meas_grad)
+        
         # compute metrics every after one pass of leapfrog integrator
         metrics = [c, step_size, (meas-ref).norm(), (p_grad-meas_grad).abs().mean(), (p_grad-meas_grad).abs().max()]
         update_pbar_desc(pbar, metrics, pbar_labels)
@@ -175,21 +204,26 @@ class LangevinOptimizer(torch.nn.Module):
 
                 for s in range(n_steps_each):
 
-                    # Modified by Helbert Paat
-                    momentum = torch.randn_like(samples)        # 1 x C x X x Y           # Same as sample but normally distributed
-                    # TODO Make it learned --> momentum is multi gaussian with cov mat # learn covariance mat to reduce the no of iterations to achieve better quality # Think of loss functions, data to use
-                    samples_star, momentum_star, traj, scores = self.leapfrog_traj(samples, momentum, 5, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps)
-                    # 1 x C x X x Y   # 1 x C x X x Y  # len of traj is (L+1) including initial sample
-                    # TODO Reduce L --> faster  # ideal is 10-15 mins for entire HMC
+                    # Modified/changed by Helbert Paat
+                    momentum = torch.randn_like(samples)        # 1 x C x X x Y    # Same as sample but normally distributed
+                    # TODO Make the momentum learned --> momentum is multi-gaussian with cov mat # learn covariance mat to reduce the no of iterations to achieve better quality # Think of loss functions, data to use
+                    samples_star, momentum_star, traj, scores = self.leapfrog_traj(samples, momentum.detach().clone(), 10, step_size, labels, forward_operator, estimated_mvue, ref, pbar, pbar_labels, c, maps)
+                    # 1 x C x X x Y   # 1 x C x X x Y  # len of traj is (L+1) including initial sample where L is the number of leapfrog steps
+                    # TODO Reduce L --> faster  # ideal is 10-15 mins for entire HMC for one sample
                     # Larger step size --> faster (as long as quality does not suffer)
 
                     log_accept_ratio = 0
                     for index,tr in enumerate(traj[1:]):
-                        log_accept_ratio += torch.matmul(-scores[index], (tr-traj[index]))     # Why perform dot product?    # 1 x C x X x Y     # What is the dimension of this? # TODO Double check the numerical approximation
+                        #log_accept_ratio += torch.matmul(-scores[index], (tr-traj[index]))     # Why perform dot product?    # 1 x C x X x Y     # What is the dimension of this? # TODO Double check the numerical approximation
+                        log_accept_ratio += torch.sum(-scores[index]*(tr-traj[index]), [-1,-2,-3])
                     #h0 = -target.log_density(q0) + (p0 * p0).sum() / 2
                     #h = -target.log_density(q_star) + (p_star * p_star).sum() / 2
-                    log_accept_ratio += (momentum_star*momentum_star).sum()/2 - (momentum*momentum).sum()/2
+                    log_accept_ratio += (momentum_star*momentum_star).sum()/2 - (momentum*momentum).sum()/2 # TODO Why is this additional term always zero?
                     #log_accept_ratio += momentum_star.sum() - momentum.sum() 
+
+                    with open('/home/hpaat/FF/csgm-mri-langevin/outputs/log_acc_ratio.txt', 'a') as f:
+                        f.write(str(log_accept_ratio) + '\n')
+                        f.close() 
 
                     if np.random.random() < np.exp(log_accept_ratio.mean().item()): # Should we really use the mean here?
                         samples = samples_star
